@@ -10,6 +10,14 @@ from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, 
 from models.sparse_embedding import CastedSparseEmbedding
 
 
+@dataclass
+class TinyReInjectionModel_Carry:
+    """Minimal carry structure for non-ACT model. Only stores labels for loss computation."""
+    steps: torch.Tensor
+    halted: torch.Tensor
+    current_data: Dict[str, torch.Tensor]
+
+
 class TinyReInjectionModel_Config(BaseModel):
     batch_size: int
     seq_len: int
@@ -17,10 +25,16 @@ class TinyReInjectionModel_Config(BaseModel):
     num_puzzle_identifiers: int
     vocab_size: int
 
-    # Flattened structure config
-    N_supervision: int  # Number of supervision steps
-    T: int  # Number of passes per supervision step
-    n: int  # Number of blocks with input reinjection
+    # Structure config (compatible with trm.yaml naming)
+    H_cycles: int  # Number of high-level cycles (number of modules in the model)
+    L_cycles: int  # Number of low-level cycles per high-level cycle (number of layers in a module)
+    L_layers: int  # Number of transformer layers (number of blocks in a layer with input reinjection)
+    H_layers: int = 0  # Ignored, for compatibility
+
+    # # Flattened structure config
+    # N_supervision: int  # Number of supervision steps
+    # T: int  # Number of passes per supervision step
+    # n: int  # Number of blocks with input reinjection
 
     # Transformer config
     hidden_size: int
@@ -33,6 +47,11 @@ class TinyReInjectionModel_Config(BaseModel):
     
     forward_dtype: str = "bfloat16"
     puzzle_emb_len: int = 16  # if non-zero, its specified to this value
+    
+    # ACT config (ignored, for compatibility)
+    halt_max_steps: int = 1
+    halt_exploration_prob: float = 0.0
+    no_ACT_continue: bool = True
 
 
 class TinyReInjectionModelBlock(nn.Module):
@@ -104,7 +123,7 @@ class TinyReInjectionModelLayer(nn.Module):
     def __init__(self, config: TinyReInjectionModel_Config):
         super().__init__()
         self.config = config
-        self.blocks = nn.ModuleList([TinyReInjectionModelBlock(config) for _ in range(config.l_layers)])
+        self.blocks = nn.ModuleList([TinyReInjectionModelBlock(config) for _ in range(config.L_layers)])
     
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor, input_injection: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if input_injection is not None:
@@ -117,7 +136,7 @@ class TinyReInjectionModule(nn.Module):
     def __init__(self, config: TinyReInjectionModel_Config):
         super().__init__()
         self.config = config
-        self.layers = nn.ModuleList([TinyReInjectionModelLayer(config) for _ in range(config.l_cycles)])
+        self.layers = nn.ModuleList([TinyReInjectionModelLayer(config) for _ in range(config.L_cycles)])
         self.final_layer = TinyReInjectionModelLayer(config)
     
     def forward(self, cos_sin: CosSin, y: torch.Tensor, z: torch.Tensor, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -195,7 +214,13 @@ class TinyReInjectionModel(nn.Module):
             persistent=True
         )
 
-        self.modules = nn.ModuleList([TinyReInjectionModule(self.config) for _ in range(self.config.h_cycles)])
+        self.modules = nn.ModuleList([TinyReInjectionModule(self.config) for _ in range(self.config.H_cycles)])
+        
+        # Dummy Q-head for compatibility (not used without ACT)
+        self.q_head = CastedLinear(self.config.hidden_size, 2, bias=True)
+        with torch.no_grad():
+            self.q_head.weight.zero_()
+            self.q_head.bias.fill_(-5)  # type: ignore
 
     @property
     def puzzle_emb(self):
@@ -236,7 +261,16 @@ class TinyReInjectionModel(nn.Module):
             return self.rotary_emb()
         return None
 
-    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def initial_carry(self, batch: Dict[str, torch.Tensor]):
+        """Create initial carry with labels. All sequences are 'halted' since no ACT."""
+        batch_size = batch["inputs"].shape[0]
+        return TinyReInjectionModel_Carry(
+            steps=torch.zeros((batch_size,), dtype=torch.int32),
+            halted=torch.ones((batch_size,), dtype=torch.bool),  # All halted (no ACT)
+            current_data={k: v.clone() for k, v in batch.items()}
+        )
+
+    def forward(self, carry: TinyReInjectionModel_Carry, batch: Dict[str, torch.Tensor]) -> Tuple[TinyReInjectionModel_Carry, Dict[str, torch.Tensor]]:
         """
         Forward pass with flattened structure:
         - N_supervision outer loop
@@ -259,12 +293,29 @@ class TinyReInjectionModel(nn.Module):
         # final block: no input reinjection
         # y, z = self.final_block(**seq_info, y=y, z=z, input_injection=None)
 
+
         for module in self.modules:
             y, z = module(cos_sin=seq_info["cos_sin"], y=y, z=z, x=x)
 
         # Output heads
         y_hat = self.lm_head(y)[:, self.puzzle_emb_len:]  # Remove puzzle embedding prefix
+        
+        # Dummy Q-head logits for compatibility (not used without ACT)
+        q_logits = self.q_head(y[:, 0]).to(torch.float32)  # Use first puzzle_emb position
+        
+        # Update carry: keep labels, mark all as halted (single forward pass)
+        new_carry = TinyReInjectionModel_Carry(
+            steps=torch.ones((batch_size,), dtype=torch.int32),  # Single step
+            halted=torch.ones((batch_size,), dtype=torch.bool),  # All halted
+            current_data={"labels": batch["labels"]}  # Keep labels for loss
+        )
+        
+        outputs = {
+            "logits": y_hat,
+            "q_halt_logits": q_logits[..., 0],  # Dummy values for compatibility
+            "q_continue_logits": q_logits[..., 1],  # Dummy values for compatibility
+        }
 
-        return y_hat
+        return new_carry, outputs
         
 
