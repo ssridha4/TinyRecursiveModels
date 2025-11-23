@@ -1,8 +1,13 @@
-**/_pycache_/
-.*pyc
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
 checkpoints/
 logs/
 model_checkpoints/
 data/
 outputs/
 wandb/
+.env
