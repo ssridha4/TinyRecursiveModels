@@ -52,6 +52,7 @@ class TinyReInjectionModel_Config(BaseModel):
     halt_max_steps: int = 1
     halt_exploration_prob: float = 0.0
     no_ACT_continue: bool = True
+    dropout_rate: float = 1.0
 
 
 class TinyReInjectionModelBlock(nn.Module):
@@ -118,12 +119,12 @@ class TinyReInjectionModelLayer(nn.Module):
         return hidden_states
 
 class TinyReInjectionModule(nn.Module):
-    def __init__(self, config: TinyReInjectionModel_Config, expansion_rate: float = 1.0):
+    def __init__(self, config: TinyReInjectionModel_Config):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([TinyReInjectionModelLayer(config) for _ in range(config.L_cycles)])
         
-        self.dropout_rate = (config.L_cycles-1)/config.L_cycles / expansion_rate
+        self.dropout_rate = config.dropout_rate
         self.dropout_layers = nn.ModuleList([nn.Dropout(self.dropout_rate) for _ in range(config.L_cycles)])
         
         self.final_layer = TinyReInjectionModelLayer(config)
