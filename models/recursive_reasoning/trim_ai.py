@@ -41,6 +41,7 @@ class TinyReInjectionModel_Config(BaseModel):
     expansion: float
     num_heads: int
     pos_encodings: str
+    dropout_rate: float
 
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
@@ -52,7 +53,6 @@ class TinyReInjectionModel_Config(BaseModel):
     halt_max_steps: int = 1
     halt_exploration_prob: float = 0.0
     no_ACT_continue: bool = True
-    dropout_rate: float = 1.0
 
 
 class TinyReInjectionModelBlock(nn.Module):
